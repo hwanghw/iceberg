@@ -679,6 +679,105 @@ public class TestCreateChangelogViewProcedure extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testMergeOnReadDeleteIsNotSupported() {
+    // Create a v2 table with merge-on-read delete mode
+    sql(
+        "CREATE TABLE %s (id INT, data STRING) USING iceberg "
+            + "TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read')",
+        tableName);
+
+    // Insert initial rows
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b'), (3, 'c')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    // Delete a row using MOR — this produces a delete file, not a data file rewrite.
+    sql("DELETE FROM %s WHERE id = 2", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // Verify the row is actually deleted from the table
+    assertEquals(
+        "Table should only have rows 1 and 3 after delete",
+        ImmutableList.of(row(1, "a"), row(3, "c")),
+        sql("SELECT * FROM %s ORDER BY id", tableName));
+
+    // The changelog view procedure itself succeeds (it only creates a lazy view),
+    // but querying the view fails because BaseIncrementalChangelogScan.orderedChangelogSnapshots()
+    // throws UnsupportedOperationException when it encounters snapshots with delete manifests.
+    List<Object[]> returns =
+        sql(
+            "CALL %s.system.create_changelog_view("
+                + "table => '%s',"
+                + "options => map('%s','%s','%s','%s'))",
+            catalogName,
+            tableName,
+            SparkReadOptions.START_SNAPSHOT_ID,
+            snap1.snapshotId(),
+            SparkReadOptions.END_SNAPSHOT_ID,
+            snap2.snapshotId());
+
+    String viewName = (String) returns.get(0)[0];
+
+    // Querying the view triggers the scan which fails on MOR delete files.
+    // A correct implementation would return: row(2, "b", DELETE, 0, snap2.snapshotId())
+    assertThatThrownBy(() -> sql("SELECT * FROM %s ORDER BY _change_ordinal, id", viewName))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessage("Delete files are currently not supported in changelog scans");
+  }
+
+  @TestTemplate
+  public void testMergeOnReadUpdateIsNotSupported() {
+    // Create a v2 table with merge-on-read update mode
+    sql(
+        "CREATE TABLE %s (id INT, data STRING) USING iceberg "
+            + "TBLPROPERTIES ('format-version'='2', "
+            + "'write.update.mode'='merge-on-read', "
+            + "'write.delete.mode'='merge-on-read')",
+        tableName);
+
+    // Insert initial rows
+    sql("INSERT INTO %s VALUES (1, 'a'), (2, 'b')", tableName);
+    Table table = validationCatalog.loadTable(tableIdent);
+    Snapshot snap1 = table.currentSnapshot();
+
+    // Update a row using MOR — this produces a delete file + a new data file for the updated row.
+    sql("UPDATE %s SET data = 'x' WHERE id = 2", tableName);
+    table.refresh();
+    Snapshot snap2 = table.currentSnapshot();
+
+    // Verify the update is reflected in the table
+    assertEquals(
+        "Table should reflect the update",
+        ImmutableList.of(row(1, "a"), row(2, "x")),
+        sql("SELECT * FROM %s ORDER BY id", tableName));
+
+    // The changelog view procedure itself succeeds (lazy view creation),
+    // but querying the view fails because the MOR update snapshot has delete manifests.
+    List<Object[]> returns =
+        sql(
+            "CALL %s.system.create_changelog_view("
+                + "table => '%s',"
+                + "options => map('%s','%s','%s','%s'))",
+            catalogName,
+            tableName,
+            SparkReadOptions.START_SNAPSHOT_ID,
+            snap1.snapshotId(),
+            SparkReadOptions.END_SNAPSHOT_ID,
+            snap2.snapshotId());
+
+    String viewName = (String) returns.get(0)[0];
+
+    // Querying the view triggers the scan which fails on MOR delete files.
+    // A correct implementation would return:
+    //   row(2, "b", DELETE, 0, snap2.snapshotId())
+    //   row(2, "x", INSERT, 0, snap2.snapshotId())
+    assertThatThrownBy(() -> sql("SELECT * FROM %s ORDER BY _change_ordinal, id", viewName))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessage("Delete files are currently not supported in changelog scans");
+  }
+
+  @TestTemplate
   public void testUpdateWithInComparableType() {
     sql(
         "CREATE TABLE %s (id INT NOT NULL, data MAP<STRING,STRING>, age INT) USING iceberg",

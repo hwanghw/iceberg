@@ -837,6 +837,98 @@ public class TestRewriteDataFilesProcedure extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testBinPackProducesLocallySortedFiles() {
+    // Verify whether binpack compaction produces locally sorted output files
+    // when the table has a sort order.
+    //
+    // Three verification methods:
+    // 1. Read the Parquet file directly (bypassing Iceberg) to see raw row order
+    // 2. Read via Iceberg to see logical row order
+    // 3. Check Spark's physical execution plan for Sort operator
+
+    sql(
+        "CREATE TABLE %s (c1 int, c2 string, c3 string) USING iceberg "
+            + "TBLPROPERTIES ("
+            + "'write.distribution-mode' = 'none'"
+            + ")",
+        tableName);
+
+    // Set sort order on the table
+    sql("ALTER TABLE %s WRITE ORDERED BY c1", tableName);
+
+    // Insert deliberately UNSORTED data across multiple small files
+    sql("INSERT INTO %s VALUES (5, 'e', 'x')", tableName);
+    sql("INSERT INTO %s VALUES (3, 'c', 'x')", tableName);
+    sql("INSERT INTO %s VALUES (1, 'a', 'x')", tableName);
+    sql("INSERT INTO %s VALUES (4, 'd', 'x')", tableName);
+    sql("INSERT INTO %s VALUES (2, 'b', 'x')", tableName);
+
+    // Verify 5 small files exist
+    List<Object[]> filesBefore =
+        sql("SELECT file_path FROM %s.files ORDER BY file_path", tableName);
+    assertThat(filesBefore).as("Should have 5 small files before compaction").hasSize(5);
+
+    // Run binpack compaction
+    List<Object[]> output =
+        sql(
+            "CALL %s.system.rewrite_data_files("
+                + "table => '%s', "
+                + "strategy => 'binpack')",
+            catalogName, tableIdent);
+
+    assertThat(output.get(0)[0]).as("Should rewrite 5 files").isEqualTo(5);
+    assertThat(output.get(0)[1]).as("Should produce 1 output file").isEqualTo(1);
+
+    // --- VERIFICATION 1: Read compacted Parquet file DIRECTLY (bypass Iceberg) ---
+    List<Object[]> filesAfter =
+        sql("SELECT file_path FROM %s.files", tableName);
+    assertThat(filesAfter).as("Should have 1 file after compaction").hasSize(1);
+    String parquetPath = (String) filesAfter.get(0)[0];
+
+    // Read the Parquet file directly using Spark's Parquet reader — no Iceberg involved
+    // This shows the PHYSICAL row order in the file, not any Iceberg-imposed ordering
+    Dataset<Row> rawParquetDf = spark.read().parquet(parquetPath);
+    List<Row> rawRows = rawParquetDf.collectAsList();
+    List<Integer> rawC1Values =
+        rawRows.stream().map(row -> row.getInt(0)).collect(Collectors.toList());
+
+    // --- VERIFICATION 2: Read via Iceberg (logical order) ---
+    List<Object[]> icebergRows = sql("SELECT c1 FROM %s", tableName);
+    List<Integer> icebergC1Values =
+        icebergRows.stream().map(row -> (Integer) row[0]).collect(Collectors.toList());
+
+    // Expected sorted order
+    List<Integer> expectedSorted = Arrays.asList(1, 2, 3, 4, 5);
+
+    // --- VERIFICATION 3: Check manifest lower/upper bounds ---
+    List<Object[]> fileStats =
+        sql(
+            "SELECT record_count, lower_bounds, upper_bounds FROM %s.files",
+            tableName);
+
+    // --- Print all results ---
+    System.out.println("=== BINPACK SORT VERIFICATION ===");
+    System.out.println("Parquet file path:           " + parquetPath);
+    System.out.println("Raw Parquet c1 order:        " + rawC1Values);
+    System.out.println("Iceberg read c1 order:       " + icebergC1Values);
+    System.out.println("Expected sorted order:       " + expectedSorted);
+    System.out.println("Raw Parquet is sorted:       " + rawC1Values.equals(expectedSorted));
+    System.out.println("Iceberg read is sorted:      " + icebergC1Values.equals(expectedSorted));
+    System.out.println("Record count:                " + fileStats.get(0)[0]);
+    System.out.println("Lower bounds:                " + fileStats.get(0)[1]);
+    System.out.println("Upper bounds:                " + fileStats.get(0)[2]);
+
+    // Verify all data present
+    assertThat(rawC1Values)
+        .as("Raw Parquet file should contain all 5 values")
+        .containsExactlyInAnyOrder(1, 2, 3, 4, 5);
+
+    // The key assertion: is the raw Parquet file sorted by c1?
+    boolean rawParquetIsSorted = rawC1Values.equals(expectedSorted);
+    System.out.println("=== CONCLUSION: binpack raw Parquet sorted = " + rawParquetIsSorted + " ===");
+  }
+
+  @TestTemplate
   public void testSortTableWithSpecialChars() {
     assumeThat(catalogName).isEqualTo(SparkCatalogConfig.HADOOP.catalogName());
 

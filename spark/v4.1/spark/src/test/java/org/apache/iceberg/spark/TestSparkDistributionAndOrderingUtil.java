@@ -402,6 +402,278 @@ public class TestSparkDistributionAndOrderingUtil extends TestBaseWithCatalog {
     checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
   }
 
+  // =================================================================
+  // Conflict: WRITE ORDERED BY (sort order) + write.distribution-mode
+  // =================================================================
+  //
+  // When a table has a sort order (e.g. from WRITE ORDERED BY) but the
+  // write.distribution-mode property is explicitly set to hash, the
+  // distribution mode takes precedence. The sort order is demoted from
+  // a global range distribution to local ordering within hash partitions.
+  //
+  // PARTITIONED BY date, ORDERED BY id
+  // -------------------------------------------------------------------------
+  // 1. WRITE ORDERED BY sets mode=range -> ORDER BY date, id (global sort)
+  // 2. Then override mode=hash         -> CLUSTER BY date + LOCAL ORDER BY date, id
+  // 3. Then override mode=none         -> unspecified dist + LOCAL ORDER BY date, id
+  //
+  // UNPARTITIONED, ORDERED BY id, data
+  // -------------------------------------------------------------------------
+  // mode=hash on unpartitioned -> adjusted to NONE -> unspecified dist + LOCAL ORDER BY id, data
+
+  @TestTemplate
+  public void testHashOverridesWriteOrderedByOnPartitionedTable() {
+    // Simulates: WRITE ORDERED BY sets sort order, then user overrides mode to hash
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    // Step 1: Set sort order (as WRITE ORDERED BY would)
+    table.replaceSortOrder().asc("id").commit();
+
+    // Step 2: Override distribution mode to hash (conflict with sort order's range intent)
+    table.updateProperties().set(WRITE_DISTRIBUTION_MODE, WRITE_DISTRIBUTION_MODE_HASH).commit();
+
+    // Hash distribution wins: data is clustered by partition columns only
+    Expression[] expectedClustering = new Expression[] {Expressions.identity("date")};
+    Distribution expectedDistribution = Distributions.clustered(expectedClustering);
+
+    // Sort order is demoted to local ordering (partition cols prepended)
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testNoneOverridesWriteOrderedByOnPartitionedTable() {
+    // Simulates: WRITE ORDERED BY sets sort order, then user overrides mode to none
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    table.replaceSortOrder().asc("id").commit();
+    table.updateProperties().set(WRITE_DISTRIBUTION_MODE, WRITE_DISTRIBUTION_MODE_NONE).commit();
+
+    // No distribution at all, sort order is local only
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+
+    checkWriteDistributionAndOrdering(table, UNSPECIFIED_DISTRIBUTION, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testHashDistributionDemotedToNoneOnUnpartitionedSortedTable() {
+    // HASH on unpartitioned table is adjusted to NONE by adjustWriteDistributionMode()
+    sql("CREATE TABLE %s (id bigint, data string) USING iceberg", tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    table.replaceSortOrder().asc("id").asc("data").commit();
+    table.updateProperties().set(WRITE_DISTRIBUTION_MODE, WRITE_DISTRIBUTION_MODE_HASH).commit();
+
+    // Hash on unpartitioned -> adjusted to NONE
+    // Sort order still applies locally
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("data"), SortDirection.ASCENDING)
+        };
+
+    checkWriteDistributionAndOrdering(table, UNSPECIFIED_DISTRIBUTION, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testRangePreservesGlobalSortOnPartitionedSortedTable() {
+    // Contrast test: when mode=range is kept (as WRITE ORDERED BY intended),
+    // the sort order produces a true global range distribution
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    table.replaceSortOrder().asc("id").commit();
+    table.updateProperties().set(WRITE_DISTRIBUTION_MODE, WRITE_DISTRIBUTION_MODE_RANGE).commit();
+
+    // Range distribution: global sort by partition + sort columns
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+    Distribution expectedDistribution = Distributions.ordered(expectedOrdering);
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testDefaultDistributionModeAutoSelectsRangeForSortedTable() {
+    // Java API path: sort order set via replaceSortOrder(), no explicit distribution mode property.
+    // defaultWriteDistributionMode() detects the sort order and auto-selects RANGE.
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    // Only set sort order via Java API — no write.distribution-mode property at all
+    table.replaceSortOrder().asc("id").commit();
+
+    // defaultWriteDistributionMode() sees isSorted()=true -> returns RANGE
+    // Same result as DDL path (WRITE ORDERED BY), which explicitly writes mode=range
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+    Distribution expectedDistribution = Distributions.ordered(expectedOrdering);
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testDefaultDistributionModeAutoSelectsHashForPartitionedUnsortedTable() {
+    // Java API path: partitioned table with no sort order and no explicit distribution mode.
+    // defaultWriteDistributionMode() sees isPartitioned()=true, isUnsorted()=true -> HASH.
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date)",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    disableFanoutWriters(table);
+
+    Expression[] expectedClustering = new Expression[] {Expressions.identity("date")};
+    Distribution expectedDistribution = Distributions.clustered(expectedClustering);
+
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+        };
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
+  // =====================================================================
+  // Hidden partitions + default distribution mode (no explicit property)
+  // =====================================================================
+  //
+  // PARTITIONED BY (days(ts)), ORDERED BY id, mode NOT SET
+  // -------------------------------------------------------------------------
+  // defaultWriteDistributionMode() sees isSorted()=true -> RANGE
+  // SortOrderUtil.buildSortOrder() prepends days(ts) -> ORDER BY days(ts), id
+  //
+  // PARTITIONED BY (days(ts)), UNORDERED, mode NOT SET
+  // -------------------------------------------------------------------------
+  // defaultWriteDistributionMode() sees isPartitioned()=true -> HASH
+  // CLUSTER BY days(ts) + LOCAL ORDER BY days(ts) (or EMPTY if fanout)
+  //
+  // PARTITIONED BY (date, bucket(8, data)), ORDERED BY id, mode NOT SET
+  // -------------------------------------------------------------------------
+  // defaultWriteDistributionMode() sees isSorted()=true -> RANGE
+  // SortOrderUtil.buildSortOrder() prepends date, bucket(8,data) -> ORDER BY date, bucket(8,data), id
+
+  @TestTemplate
+  public void testDefaultModeWithHiddenPartitionAndSortOrder() {
+    // Hidden partition via days() transform + sort order via Java API, no explicit mode.
+    // defaultWriteDistributionMode() sees isSorted()=true -> RANGE (sorted wins over partitioned).
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (days(ts))",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    table.replaceSortOrder().asc("id").commit();
+
+    // SortOrderUtil.buildSortOrder() prepends days(ts) before user's sort order
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.days("ts"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+    Distribution expectedDistribution = Distributions.ordered(expectedOrdering);
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
+  @TestTemplate
+  public void testDefaultModeWithHiddenPartitionUnsorted() {
+    // Hidden partition via days() transform, no sort order, no explicit mode.
+    // defaultWriteDistributionMode() sees isPartitioned()=true, isUnsorted()=true -> HASH.
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (days(ts))",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    disableFanoutWriters(table);
+
+    Expression[] expectedClustering = new Expression[] {Expressions.days("ts")};
+    Distribution expectedDistribution = Distributions.clustered(expectedClustering);
+
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.days("ts"), SortDirection.ASCENDING)
+        };
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+
+    enableFanoutWriters(table);
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, EMPTY_ORDERING);
+  }
+
+  @TestTemplate
+  public void testDefaultModeWithMultipleHiddenPartitionsAndSortOrder() {
+    // Mixed identity + hidden partition, sort order via Java API, no explicit mode.
+    // defaultWriteDistributionMode() sees isSorted()=true -> RANGE.
+    sql(
+        "CREATE TABLE %s (id BIGINT, data STRING, date DATE, ts TIMESTAMP) "
+            + "USING iceberg "
+            + "PARTITIONED BY (date, bucket(8, data))",
+        tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+
+    table.replaceSortOrder().asc("id").commit();
+
+    // SortOrderUtil.buildSortOrder() prepends date and bucket(8, data) before user's id
+    SortOrder[] expectedOrdering =
+        new SortOrder[] {
+          Expressions.sort(Expressions.column("date"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.bucket(8, "data"), SortDirection.ASCENDING),
+          Expressions.sort(Expressions.column("id"), SortDirection.ASCENDING)
+        };
+    Distribution expectedDistribution = Distributions.ordered(expectedOrdering);
+
+    checkWriteDistributionAndOrdering(table, expectedDistribution, expectedOrdering);
+  }
+
   // =============================================================
   // Distribution and ordering for copy-on-write DELETE operations
   // =============================================================
@@ -3019,7 +3291,7 @@ public class TestSparkDistributionAndOrderingUtil extends TestBaseWithCatalog {
   }
 
   private void disableFanoutWriters(Table table) {
-    table.updateProperties().set(SPARK_WRITE_PARTITIONED_FANOUT_ENABLED, "false").commit();
+        table.updateProperties().set(SPARK_WRITE_PARTITIONED_FANOUT_ENABLED, "false").commit();
   }
 
   private void enableFanoutWriters(Table table) {
