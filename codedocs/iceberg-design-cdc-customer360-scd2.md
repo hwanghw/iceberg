@@ -454,6 +454,81 @@ WHEN NOT MATCHED THEN INSERT *
 """)
 ```
 
+### A2b. SCD2 merge logic — Spark SQL version
+
+```sql
+-- Step 1: Assume CDC batch is already available as a temp view `cdc_raw`
+-- (loaded from Kafka and registered as a view by the ingestion layer)
+
+-- Step 2: Dedup — keep latest change per customer_id
+CREATE OR REPLACE TEMP VIEW cdc_deduped AS
+SELECT *
+FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY source_updated_at DESC) AS rn
+    FROM cdc_raw
+) t
+WHERE rn = 1;
+
+-- Step 3: Prepare new SCD2 rows with surrogate key and SCD2 columns
+CREATE OR REPLACE TEMP VIEW new_rows AS
+SELECT
+    monotonically_increasing_id()          AS customer_dim_key,
+    customer_id,
+    first_name,
+    last_name,
+    email,
+    phone,
+    address,
+    city,
+    country,
+    loyalty_tier,
+    source_updated_at,
+    CURRENT_DATE()                         AS eff_start_date,
+    CAST('9999-12-31' AS DATE)             AS eff_end_date,
+    TRUE                                   AS is_current
+FROM cdc_deduped;
+
+-- Step 4: Build expired rows — existing current rows that need to be closed out
+CREATE OR REPLACE TEMP VIEW to_expire AS
+SELECT
+    t.customer_dim_key,
+    t.customer_id,
+    t.first_name,
+    t.last_name,
+    t.email,
+    t.phone,
+    t.address,
+    t.city,
+    t.country,
+    t.loyalty_tier,
+    t.source_updated_at,
+    t.eff_start_date,
+    n.eff_start_date                       AS eff_end_date,
+    FALSE                                  AS is_current
+FROM catalog.customer360.customers t
+INNER JOIN new_rows n
+    ON t.customer_id = n.customer_id
+   AND t.is_current = TRUE;
+
+-- Step 5: Union expired + new rows into a single staged view
+CREATE OR REPLACE TEMP VIEW staged_changes AS
+SELECT * FROM new_rows
+UNION ALL
+SELECT * FROM to_expire;
+
+-- Step 6: MERGE into Iceberg target
+--   MATCHED  → update existing row (expire it: set eff_end_date + is_current=false)
+--   NOT MATCHED → insert new SCD2 row
+MERGE INTO catalog.customer360.customers AS target
+USING staged_changes AS source
+ON target.customer_dim_key = source.customer_dim_key
+WHEN MATCHED THEN UPDATE SET
+    target.eff_end_date   = source.eff_end_date,
+    target.is_current     = source.is_current
+WHEN NOT MATCHED THEN INSERT *;
+```
+
 ### A3. Temporal join: link sales to correct customer version
 
 ```python
@@ -474,6 +549,21 @@ result = sales_df.join(customers_df, join_cond, "leftouter") \
             .otherwise(customers_df.customer_dim_key)
             .alias("customer_dim_key_resolved")
     )
+```
+
+### A3b. Temporal join — Spark SQL version
+
+```sql
+-- Left join sales to the customer version that was active at the time of the sale.
+-- COALESCE handles unmatched rows (no customer version found) by defaulting to -1.
+SELECT
+    s.*,
+    COALESCE(c.customer_dim_key, -1) AS customer_dim_key_resolved
+FROM catalog.customer360.sales s
+LEFT JOIN catalog.customer360.customers c
+    ON  s.customer_id   = c.customer_id
+    AND s.event_time   >= c.eff_start_date
+    AND s.event_time    < c.eff_end_date;
 ```
 
 ### A4. Compaction with MOR delete file cleanup

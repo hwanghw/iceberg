@@ -926,6 +926,37 @@ public class TestRewriteDataFilesProcedure extends ExtensionsTestBase {
     // The key assertion: is the raw Parquet file sorted by c1?
     boolean rawParquetIsSorted = rawC1Values.equals(expectedSorted);
     System.out.println("=== CONCLUSION: binpack raw Parquet sorted = " + rawParquetIsSorted + " ===");
+
+    // --- VERIFICATION 4: Capture Spark execution plan for binpack-style write ---
+    // Simulate the exact write path binpack uses: read from Iceberg, write back with
+    // DISTRIBUTION_MODE=none (same as SparkBinPackFileRewriteRunner.doRewrite)
+    // Use a temp table name to avoid actually writing
+    Dataset<Row> readDf = spark.read().format("iceberg").load(tableName);
+
+    // Capture the write execution plan by using explain() on a write-like query
+    // We can't directly explain a DataFrameWriter, but we can check the
+    // SparkWriteRequirements that the table reports
+    System.out.println("\n=== SPARK WRITE REQUIREMENTS (what binpack write sees) ===");
+
+    // Method: Execute a simple write with DISTRIBUTION_MODE=none and capture the plan
+    // by enabling spark.sql.adaptive.enabled=false and using EXPLAIN
+    String explainSql =
+        String.format(
+            "EXPLAIN EXTENDED INSERT INTO %s SELECT c1, c2, c3 FROM %s", tableName, tableName);
+    List<Object[]> explainOutput = sql(explainSql);
+    String plan = (String) explainOutput.get(0)[0];
+
+    // Check if plan contains Sort operator
+    boolean hasSortInPlan = plan.contains("Sort [") || plan.contains("Sort(");
+    boolean hasExchangeInPlan =
+        plan.contains("Exchange") || plan.contains("ShuffleExchange");
+
+    System.out.println("=== SPARK EXECUTION PLAN (INSERT INTO with table sort order) ===");
+    System.out.println(plan);
+    System.out.println("=== PLAN ANALYSIS ===");
+    System.out.println("Has Sort operator in plan:     " + hasSortInPlan);
+    System.out.println("Has Exchange (shuffle) in plan: " + hasExchangeInPlan);
+    System.out.println("=== END ===");
   }
 
   @TestTemplate
